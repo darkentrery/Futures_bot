@@ -2,6 +2,7 @@ import traceback
 from typing import Any
 
 from pybit.unified_trading import HTTP
+from pydantic import TypeAdapter
 
 from app import entity
 from app.config import config
@@ -42,28 +43,21 @@ class BybitAPI:
         logger.info(f"Create Open {order.value=} {order.price_open=}")
         return ord
 
-    def create_close_order(self, order: entity.AddOrder, price: float) -> None:
-        # order.value_close = order.value_open
-        # order.price_close = price
-        # order.created_at_close = timezone.now()
-        try:
-            ord = self.cli.place_order(
-                category=self.category,
-                symbol=self.pair,
-                side=order.close_side,
-                orderType="Market",
-                qty=str(0),
-                isLeverage=1,
-                positionIdx=order.position_idx,
-                triggerBy=self.trigger_by,
-                reduceOnly=True,
-                closeOnTrigger=True
-            )
-            # order.orderId_close = ord["result"]["orderId"]
-            logger.info(f"Create Close {order.value_open=} {order.price_open=}")
-        except Exception as e:
-            logger.error(f"{e=} {traceback.format_exc()}")
-
+    def create_close_order(self, order: entity.Order) -> dict[str, Any]:
+        ord = self.cli.place_order(
+            category=self.category,
+            symbol=self.pair,
+            side=order.close_side,
+            orderType="Market",
+            qty=str(0),
+            isLeverage=1,
+            positionIdx=order.position_idx,
+            triggerBy=self.trigger_by,
+            reduceOnly=True,
+            closeOnTrigger=True
+        )
+        logger.info(f"Create Close {order.value=} {order.price_open=}")
+        return ord
 
     # def get_position_value(self, order: Order) -> float:
     #     positions = self.cli.get_positions()
@@ -97,17 +91,19 @@ class BybitAPI:
             auth=True,
         )
 
-    def create_take_profit_order(self, order: entity.Order) -> None:
+    def create_take_profit_order(self, order: entity.Order, attr: str) -> None:
         self.cli.set_trading_stop(
             category=self.category,
             symbol=self.pair,
-            takeProfit=self.round_price_str(order.price_tp),
-            tpSize=str(order.value),
+            takeProfit=self.round_price_str(getattr(order, attr)),
+            tpSize=str(order.value / 2),
             positionIdx=order.position_idx,
-            tpslMode="Full",
-            tpTriggerBy=self.trigger_by
+            tpslMode="Partial",
+            tpTriggerBy=self.trigger_by,
+            tpOrderType="Limit",
+            tpLimitPrice=self.round_price_str(getattr(order, attr)),
         )
-        logger.info(f"Create Take profit {order.price_open=} {order.value_tokens=}")
+        logger.info(f"Create Take profit {order.price_open=} {order.value_tokens=} {getattr(order, attr)}")
 
     def create_stop_loss_order(self, order: entity.Order) -> None:
         self.cli.set_trading_stop(
@@ -145,13 +141,37 @@ class BybitAPI:
             df_orders.extend(res["list"])
         return df_orders
 
+    def get_open_orders(self) -> list[entity.BybitOrder]:
+        df_orders = []
+        res = self.cli.get_open_orders(category=self.category, limit=50)["result"]
+        df_orders.extend(res["list"])
+        return TypeAdapter(list[entity.BybitOrder]).validate_python(df_orders)
+
+    def get_last_orders_history(self) -> list[entity.BybitOrder]:
+        df_orders = []
+        res = self.cli.get_order_history(category=self.category, limit=50)["result"]
+        df_orders.extend(res["list"])
+        return TypeAdapter(list[entity.BybitOrder]).validate_python(df_orders)
+
     def get_open_orders(self) -> list[dict]:
-        return self.cli.get_open_orders(category=self.category, symbol=self.pair)["result"]["list"]
+        orders = self.cli.get_open_orders(category=self.category, symbol=self.pair)["result"]["list"]
+        return TypeAdapter(list[entity.BybitOrder]).validate_python(orders)
 
     def get_positions(self) -> list[dict]:
         return self.cli.get_positions(category=self.category, symbol=self.pair, limit=200)["result"]["list"]
 
-    # def amend_order(self, order: Order, orderId: str, price: str, step_type: str) -> None:
+    def amend_stop_loss(self, order: entity.Order, ) -> None:
+        query = {
+            "category": self.category,
+            "symbol": self.pair,
+            "orderId": order.orderId_sl,
+            # "slTriggerBy": self.setting.stop_loss_order_type,
+            "triggerPrice": self.round_price_str(order.price_ts),
+            # "triggerBy": self.setting.stop_loss_order_type
+        }
+        self.cli.amend_order(**query)
+
+    # def amend_order(self, order: entity.Order, orderId: str, price: str, step_type: str) -> None:
     #     query = {
     #         "category": self.category,
     #         "symbol": order.pair.full_name,
@@ -180,13 +200,16 @@ class BybitAPI:
     def get_instruments_info(self) -> list[dict]:
         return self.cli.get_instruments_info(category=self.category)["result"]["list"]
 
-    def get_kline(self) -> list[dict]:
-        return self.cli.get_kline(
-            catagory=self.category,
+    def get_kline(self) -> list[entity.Kline]:
+        raw_data = self.cli.get_kline(
+            category=self.category,
             symbol=self.pair,
-            interval="240",
+            interval="1",
             limit=1000
         )["result"]["list"]
+        field_names = list(entity.Kline.model_fields.keys())
+        klines = [entity.Kline(**dict(zip(field_names, row))) for row in raw_data]
+        return klines
 
     def get_usdt_wallet_balance(self) -> float:
         balance = self.cli.get_wallet_balance(accountType="UNIFIED", coin="USDT")["result"]["list"]

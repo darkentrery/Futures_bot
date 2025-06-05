@@ -1,5 +1,6 @@
 from pydantic import BaseModel
-from app.entity.order import Order, AddOrder
+from app.entity.order import Order, AddOrder, BybitOrder
+from app.entity.trade import TradeResult, Kline, Ticker
 
 
 AnyModel = dict[str, any]
@@ -12,4 +13,8 @@ __all__ = [
     "FindAllResult",
     "Order",
     "AddOrder",
+    "BybitOrder",
+    "TradeResult",
+    "Kline",
+    "Ticker",
 ]

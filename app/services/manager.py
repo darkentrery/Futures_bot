@@ -1,111 +1,74 @@
+import asyncio
 import datetime
 import traceback
 
 from pybit.exceptions import InvalidRequestError
+from pydantic import TypeAdapter
 
 from app import entity
 from app.entity.enums import OrderType
 from app.logger import logger
 from app.repository import SAUnitOfWork
 from app.services.api import BybitAPI
+from app.services.direction import MultiFrameDirectionManager
 from app.utils.datetime import utc_now
-
-
-class DirectionManager:
-    def __init__(self) -> None:
-        self.prices = []
-
-    def add(self, price: float) -> None:
-        self.prices.append(price)
-        if len(self.prices) > 3:
-            del self.prices[0]
-
-    def clear(self) -> None:
-        self.prices = []
-
-    @property
-    def direction(self) -> OrderType | None:
-        if len(self.prices) < 3:
-            return
-        up = 0
-        down = 0
-        for i, price in enumerate(self.prices[1:]):
-            if price > self.prices[i]:
-                up += 1
-            if price < self.prices[i]:
-                down += 1
-
-        percent = abs((self.prices[-1] - self.prices[0]) / self.prices[0])
-        logger.info(f"{self.prices} {percent=}")
-        if up == len(self.prices) - 1 and percent > 0.002:
-            return OrderType.long
-        if down == len(self.prices) - 1 and percent > 0.002:
-            return OrderType.short
 
 
 class Manager:
     def __init__(self, uow: SAUnitOfWork, api: BybitAPI):
         self.uow = uow
         self.api = api
-        self.direction = DirectionManager()
+        self.direction = MultiFrameDirectionManager()
         self.prices = []
+        klines = self.api.get_kline()
+        prices = klines[::-1]
+        self.direction.load_history(prices)
+        self.buy_leverage = None
+        self.sell_leverage = None
+        # atr = self.direction.main_tf.calculate_atr(period=10)
+        # pass
 
     async def run(self) -> None:
         while True:
             async with self.uow:
                 price = self.api.get_tickers()
-                price = float(price[0]["lastPrice"])
-                orders = self.api.get_all_orders_history()
-                # logger.info(f"price: {price}")
+                price = TypeAdapter(entity.Ticker).validate_python(price[0])
+                orders = self.api.get_last_orders_history()
+                open_orders = self.api.get_open_orders()
+                orders = open_orders + orders
+                result = await self.uow.order.get_trade_result(datetime.datetime(2025, 6, 4))
+                logger.info(f"{result.spent=} {result.received=} {result.difference=}")
                 self.direction.add(price)
+                direction = self.direction.get_direction()
                 exist_order = await self.uow.order.find_or_none({"close_at": None, "reverse": False})
-                reverse_order = await self.uow.order.find_or_none({"close_at": None, "reverse": True})
 
                 if exist_order:
-                    exist_order = await self._check_order_opening(exist_order, orders)
+                    exist_order = await self._check_order_opening(exist_order, orders, price.close, direction)
+                    if not exist_order:
+                        continue
                     exist_order = await self._check_order_tp_sl(exist_order, orders)
-                    exist_order = await self._set_tp(exist_order, price)
-                    exist_order = await self._set_sl(exist_order, price)
+                    exist_order = await self._set_tp(exist_order, price.close)
+                    exist_order = await self._set_sl(exist_order, price.close)
                     exist_order = await self._check_order_closing(exist_order, orders)
+                    exist_order = await self._check_trailing_stop(exist_order)
+                    exist_order = await self._check_close(exist_order, price.mark_price, direction)
 
-                    try:
-                        await self._check_create_reverse_order(exist_order, reverse_order, price)
-                    except InvalidRequestError as e:
-                        logger.error(traceback.format_exc())
-                        continue
 
-                if reverse_order:
-                    reverse_order = await self._check_cancel_order(exist_order, reverse_order)
-                    reverse_order = await self._check_order_opening(reverse_order, orders)
-                    reverse_order = await self._check_order_tp_sl(reverse_order, orders)
-                    reverse_order = await self._set_tp(reverse_order, price)
-                    reverse_order = await self._set_sl(reverse_order, price)
-                    reverse_order = await self._check_order_closing(reverse_order, orders)
+                if not exist_order:
+                        await self._set_open_order(price.close, direction)
 
-                if not exist_order and not reverse_order:
-                    try:
-                        await self._set_open_order(price)
-                    except InvalidRequestError as e:
-                        logger.error(traceback.format_exc())
-                        continue
-
-                # await asyncio.sleep(0.5)
+                # await asyncio.sleep(0.1)
 
     @staticmethod
-    def is_same_orders(order: entity.Order, ord: dict, attr: str) -> bool:
+    def is_same_orders(order: entity.Order, ord: entity.BybitOrder, attr: str) -> bool:
         order_price = getattr(order, f"price_{attr}")
-        # logger.info(
-        #     f"Same {order.pair_order.__str__()} {ord['stopOrderType']=} {ord['qty']=} {ord['triggerPrice']=} {order_price=} {order_qty=}"
-        # )
-        try:
-            trigger_price = float(ord["triggerPrice"])
-        except:
+        if not ord.trigger_price:
             return False
-
-        if float(ord["qty"]) == order.value and trigger_price == order_price:
-            if attr == "tp" and ord["stopOrderType"] == "TakeProfit":
+        if ord.qty == order.value / 2 and ord.trigger_price == order_price:
+            if attr in ["tp1", "tp2"] and ord.stop_order_type == "PartialTakeProfit":
                 return True
-            if attr == "sl" and ord["stopOrderType"] == "StopLoss":
+        if (ord.qty == order.value or ord.qty == order.value / 2) and ord.trigger_price == order_price:
+            if attr == "sl" and ord.stop_order_type == "StopLoss":
                 return True
         return False
 
@@ -116,61 +79,89 @@ class Manager:
             return True
         return False
 
-    async def _check_order_opening(self, order: entity.Order, orders: list[dict]) -> entity.Order:
+    async def _check_order_opening(
+            self, order: entity.Order, orders: list[entity.BybitOrder], price: float, direction: OrderType | None
+    ) -> entity.Order | None:
         """Need open uow."""
         if order.open_at is None:
             for ord in orders:
-                if ord["orderId"] != order.orderId_open:
+                if ord.order_id != order.orderId_open:
                     continue
-                open_at = datetime.datetime.utcfromtimestamp(int(ord["createdTime"]) / 1000).replace(tzinfo=None)
-                try:
-                    price_on_created = float(ord["lastPriceOnCreated"])
-                except:
+                if not ord.avg_price:
+                    if ord.status == "New" and (
+                        (price >= order.price_open * 1.005 and order.order_type == OrderType.long) or
+                        (price <= order.price_open * 0.995 and order.order_type == OrderType.short) or
+                        direction != order.order_type
+                    ):
+                        self.api.cancel_order(order)
+                        await self.uow.order.delete({"id": order.id})
+                        await self.uow.commit()
+                        return None
                     continue
-                if ord["orderStatus"] == "Cancelled":
+
+                if ord.status == "Cancelled":
                     order = await self.uow.order.update(
                         order.id,
                         {
-                            "open_at": open_at,
-                            "price_open": price_on_created,
-                            "price_close": price_on_created,
-                            "close_at": open_at,
-                            "tp_at": open_at,
-                            "sl_at": open_at,
+                            "open_at": ord.updated_at,
+                            "price_open": ord.avg_price,
+                            "price_close": ord.avg_price,
+                            "close_at": ord.updated_at,
+                            "tp1_at": ord.updated_at,
+                            "tp2_at": ord.updated_at,
+                            "sl_at": ord.updated_at,
                         }
                     )
-                else:
-                    order = await self.uow.order.update(order.id, {"open_at": open_at, "price_open": price_on_created})
-                await self.uow.commit()
+                    await self.uow.commit()
+                elif ord.status == "Filled":
+                    order = await self.uow.order.update(order.id, {"open_at": ord.updated_at, "price_open": ord.avg_price})
+                    await self.uow.commit()
+
         return order
 
-    async def _check_order_tp_sl(self, order: entity.Order, orders: list[dict]) -> entity.Order:
+    async def _check_order_tp_sl(self, order: entity.Order, orders: list[entity.BybitOrder]) -> entity.Order:
         """Need open uow."""
         update = False
-        if (order.tp_at and not order.orderId_tp) or (order.sl_at and not order.orderId_sl):
-            for ord in orders:
-                for attr in ["tp", "sl"]:
+        for ord in orders:
+            for attr in ["tp1", "tp2", "sl"]:
+                if getattr(order, f"{attr}_at") and not getattr(order, f"orderId_{attr}"):
                     if self.is_same_orders(order, ord, attr):
-                        time_at = datetime.datetime.utcfromtimestamp(float(ord["createdTime"]) / 1000).replace(tzinfo=None)
-                        order = await self.uow.order.update(
-                            order.id, {f"orderId_{attr}": ord["orderId"]}
-                        )
+                        order = await self.uow.order.update(order.id, {f"orderId_{attr}": ord.order_id})
                         update = True
-            if update:
-                await self.uow.commit()
+        if update:
+            await self.uow.commit()
         return order
 
     async def _set_tp(self, order: entity.Order, price: float) -> entity.Order:
-        params = {"tp_at": utc_now()}
-        if order.open_at and not order.orderId_tp and not order.tp_at:
-            if order.order_type == OrderType.long and order.price_tp < price:
-                order.price_tp = price
-                params["price_tp"] = price
-            if order.order_type == OrderType.short and order.price_tp > price:
-                order.price_tp = price
-                params["price_tp"] = price
+        params = {"tp1_at": utc_now()}
+        if order.open_at and not order.orderId_tp1 and not order.tp1_at:
+            if order.order_type == OrderType.long and order.price_tp1 < price:
+                order.price_tp1 = price
+                params["price_tp1"] = price
+            if order.order_type == OrderType.short and order.price_tp1 > price:
+                order.price_tp1 = price
+                params["price_tp1"] = price
+            try:
+                self.api.create_take_profit_order(order, "price_tp1")
+            except InvalidRequestError as e:
+                logger.error(f"{e=} \n{traceback.format_exc()}")
+                return order
+            order = await self.uow.order.update(order.id, params)
+            await self.uow.commit()
 
-            self.api.create_take_profit_order(order)
+        params = {"tp2_at": utc_now()}
+        if order.open_at and not order.orderId_tp2 and not order.tp2_at:
+            if order.order_type == OrderType.long and order.price_tp2 < price:
+                order.price_tp2 = price
+                params["price_tp2"] = price
+            if order.order_type == OrderType.short and order.price_tp2 > price:
+                order.price_tp2 = price
+                params["price_tp2"] = price
+            try:
+                self.api.create_take_profit_order(order, "price_tp2")
+            except InvalidRequestError as e:
+                logger.error(f"{e=} \n{traceback.format_exc()}")
+                return order
             order = await self.uow.order.update(order.id, params)
             await self.uow.commit()
 
@@ -186,85 +177,145 @@ class Manager:
                 order.price_sl = price
                 params["price_sl"] = price
 
-            self.api.create_stop_loss_order(order)
+            try:
+                self.api.create_stop_loss_order(order)
+            except Exception as e:
+                logger.error(f"{e=}\n{traceback.format_exc()}")
+                return order
             order = await self.uow.order.update(order.id, params)
             await self.uow.commit()
 
         return order
 
-    async def _check_order_closing(self, order: entity.Order, orders: list[dict]) -> entity.Order:
+    async def _check_order_closing(self, order: entity.Order, orders: list[entity.BybitOrder]) -> entity.Order:
         """Need open uow."""
-        update = False
-        if order.orderId_tp is not None and order.orderId_sl is not None:
+
+        if (all([order.tp1_at, order.tp2_at, order.sl_at])) or (order.orderId_close and not order.close_at):
             for ord in orders:
-                try:
-                    trigger_price = float(ord["triggerPrice"])
-                except:
+                update = False
+                if (not ord.trigger_price and not order.orderId_close) or ord.status != "Filled":
                     continue
-                if ord["orderId"] == order.orderId_tp and ord["orderStatus"] == "Filled":
-                    close_at = datetime.datetime.utcfromtimestamp(float(ord["createdTime"]) / 1000).replace(tzinfo=None)
+                if order.orderId_tp1 and ord.order_id == order.orderId_tp1 and not order.tp1_executed_at:
                     order = await self.uow.order.update(
                         order.id,
-                        {"close_at": close_at, "orderId_close": ord["orderId"], "price_close": float(ord["avgPrice"])}
+                        {
+                            "tp1_executed_at": ord.updated_at,
+                            # "price_tp1": trigger_price
+                        },
                     )
                     update = True
-                if ord["orderId"] == order.orderId_sl and ord["orderStatus"] == "Filled":
-                    close_at = datetime.datetime.utcfromtimestamp(float(ord["createdTime"]) / 1000).replace(tzinfo=None)
+                if order.orderId_tp2 and ord.order_id == order.orderId_tp2 and not order.tp2_executed_at:
                     order = await self.uow.order.update(
-                        order.id, {"close_at": close_at, "orderId_close": ord["orderId"],
-                                         "price_close": float(ord["avgPrice"])}
+                        order.id,
+                        {
+                            "close_at": ord.updated_at,
+                            "orderId_close": ord.order_id,
+                            "price_close": ord.avg_price,
+                            "tp2_executed_at": ord.updated_at,
+                            # "price_tp2": trigger_price
+                        }
                     )
                     update = True
-                if ord["orderStatus"] == "Filled" and ord["createType"] == "CreateByStopOrder" and ord[
-                    "stopOrderType"] == "StopLoss" and trigger_price == order.price_sl:
-                    close_at = datetime.datetime.utcfromtimestamp(float(ord["createdTime"]) / 1000).replace(tzinfo=None)
+                if order.orderId_sl and ord.order_id == order.orderId_sl and not order.sl_executed_at:
                     order = await self.uow.order.update(
-                        order.id, {"close_at": close_at, "orderId_close": ord["orderId"],
-                                         "price_close": float(ord["avgPrice"])}
+                        order.id, {
+                            "close_at": ord.updated_at,
+                            "orderId_close": ord.order_id,
+                            "price_close": ord.avg_price,
+                            "sl_executed_at": ord.updated_at,
+                            # "price_sl": trigger_price
+                        }
                     )
                     update = True
-            if update:
-                await self.uow.commit()
+                if (order.orderId_sl and not order.sl_executed_at and ord.create_type == "CreateByStopOrder" and
+                        ord.stop_order_type == "StopLoss" and ord.trigger_price == order.price_sl):
+                    order = await self.uow.order.update(
+                        order.id, {
+                            "close_at": ord.updated_at,
+                            "orderId_close": ord.order_id,
+                            "price_close": ord.avg_price,
+                            "sl_executed_at": ord.updated_at,
+                            # "price_sl": trigger_price
+                        }
+                    )
+                    update = True
+                if order.orderId_close and ord.order_id == order.orderId_close and not order.close_at:
+                    order = await self.uow.order.update(
+                        order.id, {
+                            "close_at": ord.updated_at,
+                            # "orderId_close": ord.order_id,
+                            "price_close": ord.avg_price,
+                            # "sl_executed_at": ord.updated_at,
+                            # "price_sl": trigger_price
+                        }
+                    )
+                    update = True
+                if update:
+                    await self.uow.commit()
 
         return order
 
-    async def _check_create_reverse_order(
-            self, order: entity.Order, reverse_order: entity.Order | None, price: float
-    ) -> None:
+    async def _set_open_order(self, price: float, direction: OrderType | None) -> None:
         """Need open uow."""
-        if order.tp_at and order.sl_at and reverse_order is None and self.is_need_open_reverse(order, price):
+        if direction in (OrderType.short, OrderType.long):
+            atr = self.direction.main_tf.calculate_atr(period=14)
+            if atr < price * 0.0015:
+                return
+            logger.info(f"Atr: {atr}")
             body = entity.AddOrder(
-                order_type=OrderType.long if order.order_type == OrderType.short else OrderType.short,
+                order_type=direction,
                 price_open=round(price, 1),
-                leverage=20,
-                reverse=True
+                leverage=10,
+                atr=atr,
             )
-            order = self.api.create_open_order(body)
+            if self.buy_leverage != body.buy_leverage or self.sell_leverage != body.sell_leverage:
+                self.api.set_leverage(body.buy_leverage, body.sell_leverage)
+                self.buy_leverage = body.buy_leverage
+                self.sell_leverage = body.sell_leverage
+            try:
+                order = self.api.create_open_order(body)
+            except InvalidRequestError as e:
+                logger.error(f"{e=}\n{traceback.format_exc()}")
+                return
             body.orderId_open = order["result"]["orderId"]
-            await self.uow.order.add(body.model_dump())
+            await self.uow.order.add(body.model_dump(exclude={"atr"}))
             await self.uow.commit()
 
-    async def _set_open_order(self, price: float) -> None:
+    async def _check_trailing_stop(self, order: entity.Order) -> entity.Order:
         """Need open uow."""
-        if self.direction.direction in (OrderType.short, OrderType.long):
-            body = entity.AddOrder(
-                order_type=self.direction.direction,
-                price_open=round(price, 1),
-                leverage=10
-            )
-            buy_leverage = body.leverage if self.direction.direction == OrderType.long else body.leverage * 2
-            sell_leverage = body.leverage if self.direction.direction == OrderType.short else body.leverage * 2
-            self.api.set_leverage(buy_leverage, sell_leverage)
-            order = self.api.create_open_order(body)
-            body.orderId_open = order["result"]["orderId"]
-            await self.uow.order.add(body.model_dump())
+        if order.orderId_sl and order.tp1_executed_at and (
+                (order.order_type == OrderType.long and order.price_sl < order.price_open) or
+                (order.order_type == OrderType.short and order.price_sl > order.price_open)
+        ):
+            try:
+                self.api.amend_stop_loss(order)
+                order = await self.uow.order.update(order.id, {"price_sl": order.price_ts})
+                await self.uow.commit()
+            except Exception as e:
+                logger.error(f"{e=}\n{traceback.format_exc()}")
+        return order
+
+    async def _check_close(self, order: entity.Order, price: float, direction: OrderType | None) -> entity.Order:
+        """Need open uow."""
+        if order.close_at or not all([order.orderId_tp1, order.orderId_tp2, order.orderId_sl]):
+            return order
+        if (
+            (order.order_type == OrderType.long and order.price_sl > price) or
+            (order.order_type == OrderType.short and order.price_sl < price) or
+            (order.order_type == OrderType.long and order.price_open * 0.998 > price) or
+            (order.order_type == OrderType.short and order.price_open * 1.002 < price) or
+            (order.tp1_executed_at and order.order_type != direction and (
+                (order.order_type == OrderType.long and order.price_tp1 * 0.998 > price) or
+                (order.order_type == OrderType.short and order.price_tp1 * 1.002 < price)
+            ))
+        ):
+            try:
+                ord = self.api.create_close_order(order)
+            except InvalidRequestError as e:
+                logger.error(f"{e=}\n{traceback.format_exc()}")
+                return order
+            order = await self.uow.order.update(order.id, {"orderId_close": ord["result"]["orderId"]})
             await self.uow.commit()
 
-    async def _check_cancel_order(self, order: entity.Order | None, reverse_order: entity.Order) -> entity.Order | None:
-        """Need open uow."""
-        if not order and not reverse_order.open_at:
-            await self.api.cancel_order(reverse_order)
-            await self.uow.order.delete({"id": reverse_order.id})
-            await self.uow.commit()
-            return None
-        return reverse_order
+        return order
+
